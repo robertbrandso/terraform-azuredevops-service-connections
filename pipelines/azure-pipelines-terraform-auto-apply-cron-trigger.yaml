@@ -1,0 +1,133 @@
+# ----------------------------------
+# TERRAFORM PIPELINE - SCHEDULED RUN
+# ----------------------------------
+
+# Together with the Terraform configuration, this pipeline is used to rotate client secrets on the Azure AD applications used for the Azure DevOps service connections on a regular basis.
+# WARNING: If other changes are made when the pipeline runs, the pipeline will apply those as well.
+
+trigger: none
+
+schedules:
+- cron: '0 1 * * *' # Time is UTC
+  displayName: Nightly run
+  branches:
+    include:
+    - main
+  always: true # Run even when no changes are made in the repository
+
+variables:
+  service_connection_name: "foo-bar" # Name of the service connection which this pipeline should run as
+  tf_version: "1.5.5" # Version of terraform to use. Use 'latest' to always use latest version available.
+  tf_state_rg_name: "rg-example-prod" # Name of the resource group to use for the Terraform state file.
+  tf_state_sa_name: "storageaccountname" # Name of the storage account to use for the Terraform state file.
+  tf_state_container_name: "tfstate" # Name of the storage container use for the Terraform state file.
+  tf_environment: "prod" # Enviroment name, can be used for the state file name among others.
+  working_directory: "$(System.DefaultWorkingDirectory)" # If Terraform files are stored in a subdirectory, define the subdirectory here, for example "$(System.DefaultWorkingDirectory)/infrastructure"
+
+pool:
+  vmImage: "ubuntu-latest"
+
+stages:
+
+  # ----------------------------
+  # STAGE: TERRAFORM APPLY
+  # Extension used: https://marketplace.visualstudio.com/items?itemName=charleszipp.azure-pipelines-tasks-terraform
+  #
+  # This stage will:
+  # * Install the chosen version of Terraform
+  # * Run terraform init to initialize the backend and download the providers
+  # * Run terraform validate to validate the code
+  # * Run terraform plan to view planned changes
+  # * Run terraform show to log a warning if there is any destroy operations
+  # * Run terraform version to view Terraform version and provider version and log warning if outdated
+  # * Run terraform apply with the plan file to apply the changes
+  # ----------------------------
+
+  - stage: "terraformApply"
+    displayName: "Terraform Apply"
+    jobs:
+
+      # --------------------
+      # Job: Terraform Apply
+      # --------------------
+      - job: "TerraformApply"
+        displayName: "Terraform > install, init, plan & apply"
+        steps:
+
+          - task: TerraformInstaller@0
+            displayName: "Install > terraform"
+            inputs:
+              terraformVersion: "$(tf_version)"
+
+          - task: TerraformCLI@0
+            displayName: "Run > terraform init"
+            inputs:
+              command: "init"
+              backendType: "azurerm"
+              backendServiceArm: "$(service_connection_name)"
+              backendAzureRmResourceGroupName: $(tf_state_rg_name)
+              backendAzureRmStorageAccountName: $(tf_state_sa_name)
+              backendAzureRmContainerName: $(tf_state_container_name)
+              backendAzureRmKey: "$(tf_environment).terraform.tfstate"
+              workingDirectory: $(working_directory)
+
+          - task: TerraformCLI@0
+            displayName: "Run > terraform validate"
+            continueOnError: false
+            inputs:
+              command: "validate"
+              environmentServiceName: "$(service_connection_name)"
+              workingDirectory: $(working_directory)
+
+          - task: TerraformCLI@0
+            displayName: "Run > terraform plan"
+            inputs:
+              command: "plan"
+              environmentServiceName: "$(service_connection_name)"
+              publishPlanResults: "PlanResults"
+              commandOptions: "-out=$(Build.Buildnumber).tfplan -var azuredevops_personal_access_token=$(azuredevops_personal_access_token)"
+              workingDirectory: $(working_directory)
+            name: "plan"
+
+          - task: TerraformCLI@0
+            displayName: "Run > terraform show"
+            inputs:
+              command: "show"
+              environmentServiceName: "$(service_connection_name)"
+              inputTargetPlanOrStateFilePath: "$(Build.Buildnumber).tfplan"
+              workingDirectory: $(working_directory)
+
+          - task: TerraformCLI@0
+            displayName: "Run > terraform version"
+            inputs:
+              command: "version"
+              environmentServiceName: "$(service_connection_name)"
+              workingDirectory: $(working_directory)
+
+          - bash: |
+              if
+                terraform show $(Build.Buildnumber).tfplan | grep "Your infrastructure matches the configuration."
+              then
+                echo "##[section]No changes. Your infrastructure matches the configuration."
+                echo "##vso[task.setvariable variable=changes]false"
+              else
+                echo "##[section]Changes detected."
+                echo "##vso[task.setvariable variable=changes]true"
+              fi
+            name: checkIfAnyChanges
+            displayName: "Check > Changes"
+            workingDirectory: $(working_directory)
+
+          # Need to delay for 1 minute, so the Terraform state file will be released in storage account after Terraform Plan task.
+          - bash: sleep 1m
+            name: sleep
+            displayName: "Delay > Sleep 1 minute"
+            workingDirectory: $(working_directory)
+
+          - task: TerraformCLI@0
+            displayName: "Run > terraform apply"
+            inputs:
+              command: "apply"
+              commandOptions: "$(Build.Buildnumber).tfplan"
+              environmentServiceName: "$(service_connection_name)"
+              workingDirectory: $(working_directory)
